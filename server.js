@@ -32,33 +32,20 @@ const client = new DynamoDBClient({
     }
 });
 
-
 app.post("/register", async (req, res) => {
-    const TABLE_NAME = 'youtube-demos';
-    const { username, email, password } = req.body;
+    const USER_TABLE = 'youtube-demos';
+    const PROFILE_TABLE = 'profile';
+    const { username, password } = req.body;
 
-    if (!username || !email || !password) {
-        return res.status(400).json({ message: "Username, Email, and Password are required" });
+    if (!username || !password) {
+        return res.status(400).json({ message: "Username and Password are required" });
     }
 
-    // Check if user already exists
-    const queryCommand = new QueryCommand({
-        TableName: TABLE_NAME,
-        IndexName: 'email-index', // Ensure a GSI exists for email lookup
-        KeyConditionExpression: "email = :email",
-        ExpressionAttributeValues: { ":email": { S: email } }
-    });
-
     try {
-        const existingUser = await client.send(queryCommand);
-        if (existingUser.Items.length > 0) {
-            return res.status(400).json({ message: "Email is already registered" });
-        }
-
         // Check if username already exists
         const usernameQuery = new QueryCommand({
-            TableName: TABLE_NAME,
-            IndexName: 'username-index', // Ensure a GSI exists for username lookup
+            TableName: USER_TABLE,
+            IndexName: 'username-index',
             KeyConditionExpression: "username = :username",
             ExpressionAttributeValues: { ":username": { S: username } }
         });
@@ -68,27 +55,78 @@ app.post("/register", async (req, res) => {
             return res.status(400).json({ message: "Username is already taken" });
         }
 
-        // Proceed with registration
-        const userId = uuidv4();
-        const putItemCommand = new PutItemCommand({
-            TableName: TABLE_NAME,
+        // Create registration timestamp
+        const registeredAt = new Date().toISOString();
+        
+        // Generate unique userId with collision check
+        let userId;
+        let isUniqueId = false;
+        
+        while (!isUniqueId) {
+            // Generate a new UUID
+            userId = uuidv4();
+            
+            // Check if userId already exists in USER_TABLE
+            const userIdQuery = new GetItemCommand({
+                TableName: USER_TABLE,
+                Key: {
+                    userId: { S: userId }
+                }
+            });
+            
+            const existingUser = await client.send(userIdQuery);
+            
+            // If no item found with this ID, it's unique
+            if (!existingUser.Item) {
+                isUniqueId = true;
+            }
+            // Otherwise, loop will continue and generate a new UUID
+        }
+        
+        // Now we have a guaranteed unique userId
+        
+        // 1. Store in main user table
+        const putUserCommand = new PutItemCommand({
+            TableName: USER_TABLE,
             Item: {
                 userId: { S: userId },
                 username: { S: username },
-                email: { S: email },
-                password: { S: password }
+                password: { S: password },
+                registeredAt: { S: registeredAt }
             }
         });
 
-        await client.send(putItemCommand);
-        res.json({ message: "User registered successfully", userId });
+        // 2. Store in profile table
+        const putProfileCommand = new PutItemCommand({
+            TableName: PROFILE_TABLE,
+            Item: {
+                userId: { S: userId },
+                username: { S: username },
+                registeredAt: { S: registeredAt },
+                bio: { S: "" },
+                avatarUrl: { S: "" }
+            }
+        });
+
+        // Execute both operations
+        await Promise.all([
+            client.send(putUserCommand),
+            client.send(putProfileCommand)
+        ]);
+        
+        res.json({ 
+            message: "User registered successfully", 
+            userId, 
+            username,
+            registeredAt,
+            token: "your-token-here" // Include your actual token generation logic
+        });
 
     } catch (error) {
+        console.error("Registration error:", error);
         res.status(500).json({ message: error.message });
     }
 });
-
-  
 
 
  
@@ -261,13 +299,14 @@ app.get('/memes', async (req, res) => {
 });
 
 const photostorage = multer.memoryStorage();
-const photoupload = multer({ storage });
+const photoupload = multer({ storage: photostorage });  // Fixed the variable reference
 
 // Profile Update API (POST)
 app.post('/profile-send', photoupload.single('file'), async (req, res) => {
-   
-    const { userId, username, name, bio, socialLinks } = req.body;
-  console.log(socialLinks);
+    const { userId, username, name, bio, socialLinks, email } = req.body;
+    
+    console.log(socialLinks);
+    
     if (!userId) return res.status(400).json({ message: 'User ID is required' });
     
     try {
@@ -277,15 +316,17 @@ app.post('/profile-send', photoupload.single('file'), async (req, res) => {
             username: { S: username }, // Username
             name: { S: name },         // User's name
             bio: { S: bio },           // Bio
+            email: { S: email }        // Email field
         };
         
         // Handle file upload if a file is provided
         if (req.file) {
             // Generate unique file ID for the profile photo
-            const fileId = uuidv4(); 
+            const fileId = uuidv4();
+            
             const fileName = `${fileId}-${req.file.originalname}`;
             const fileUrl = `https://${process.env.AWS_S3_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileName}`;
-
+            
             // Upload the profile photo to S3
             await s3.send(new PutObjectCommand({
                 Bucket: process.env.AWS_S3_BUCKET,
@@ -322,13 +363,28 @@ app.post('/profile-send', photoupload.single('file'), async (req, res) => {
                 // Continue execution even if social links parsing fails
             }
         }
-
-        // Store profile data in DynamoDB
-        await client.send(new PutItemCommand({
-            TableName: 'profile', // Assuming 'profile' is the DynamoDB table name
-            Item: profileItem,
-        }));
-
+    
+        // Create a parallel promise array for both table operations
+        const dbOperations = [
+            // Store profile data in the 'profile' table
+            client.send(new PutItemCommand({
+                TableName: 'profile',
+                Item: profileItem,
+            })),
+            
+            // Store email and userId in the 'youtube-demos' table
+            client.send(new PutItemCommand({
+                TableName: 'youtube-demos',
+                Item: {
+                    userId: { S: userId },
+                    email: { S: email }
+                }
+            }))
+        ];
+        
+        // Execute both operations in parallel
+        await Promise.all(dbOperations);
+    
         // Respond back with success message and profile photo URL if it was updated
         const response = {
             message: 'Profile updated successfully'
@@ -355,20 +411,20 @@ app.get('/profileget', async (req, res) => {
     try {
         const data = await client.send(new ScanCommand({ TableName: 'profile' }));
        
-        
-        // ✅ Fix: Correctly extract the userId from DynamoDB format
+        // Correctly extract the userId from DynamoDB format
         const userProfile = data.Items.find(user => user.userId.S === userId);
         
         if (!userProfile) {
             return res.status(404).json({ message: 'Profile not found' });
         }
         
-        // ✅ Fix: Extract string values correctly and include socialLinks
+        // Extract string values correctly and include all fields including timestamp
         const response = {
             name: userProfile.name?.S || '',
             bio: userProfile.bio?.S || '',
             profilePic: userProfile.profilePhotoUrl?.S || '',
-            username: userProfile.username?.S || ''
+            username: userProfile.username?.S || '',
+            registeredAt: userProfile.registeredAt?.S || null // Add the registration timestamp
         };
         
         // Extract and transform socialLinks if they exist
@@ -381,6 +437,17 @@ app.get('/profileget', async (req, res) => {
         } else {
             response.socialLinks = [];
         }
+
+        // If registeredAt exists, calculate days since registration
+        if (response.registeredAt) {
+            const registrationDate = new Date(response.registeredAt);
+            const currentDate = new Date();
+            const differenceInTime = currentDate.getTime() - registrationDate.getTime();
+            const differenceInDays = Math.floor(differenceInTime / (1000 * 3600 * 24));
+            
+            response.accountAgeDays = differenceInDays;
+            
+        }
         
         res.json(response);
     } catch (error) {
@@ -389,36 +456,84 @@ app.get('/profileget', async (req, res) => {
 });
 
 //profile user data
+// Enhanced getUserMedia endpoint - replace your existing one with this
+
 app.get('/getUserMedia', async (req, res) => {
-    const { userId } = req.query;
- console.log("user s sssss",userId);
+    const { userId, category } = req.query;
+    console.log("Received request for user media:", { userId, category });
+    
     if (!userId) {
-        return res.status(400).json({ message: "User ID is required" });
+        console.log("Rejected request: Missing userId");
+        return res.status(400).json({ 
+            message: "User ID is required",
+            success: false
+        });
     }
 
     try {
-        // Fetch media items belonging to the user
+        // Build FilterExpression dynamically based on whether category is provided
+        let filterExpression = "userId = :userId";
+        let expressionAttributeValues = {
+            ":userId": { S: userId }
+        };
+        
+        // Add category filter if provided
+        if (category && category !== 'All') {
+            filterExpression += " AND category = :category";
+            expressionAttributeValues[":category"] = { S: category };
+        }
+        
+        console.log("DynamoDB query:", { 
+            filterExpression,
+            expressionAttributeValues 
+        });
+        
+        // Fetch media items belonging to the user with optional category filter
         const command = new ScanCommand({
-            TableName: 'storage', // Ensure this table stores user media
-            FilterExpression: "userId = :userId",
-            ExpressionAttributeValues: {
-                ":userId": { S: userId }
-            }
+            TableName: 'storage',
+            FilterExpression: filterExpression,
+            ExpressionAttributeValues: expressionAttributeValues
         });
 
         const data = await client.send(command);
+        console.log(`Found ${data.Items?.length || 0} items in DynamoDB`);
 
+        if (!data.Items || data.Items.length === 0) {
+            // Return empty array with 200 status - this is not an error
+            return res.json([]);
+        }
+        
         // Convert DynamoDB response to normal JSON
-        const mediaItems = data.Items.map(item => unmarshall(item));
-       console.log(mediaItems);
+        const mediaItems = data.Items.map(item => {
+            const unmarshalled = unmarshall(item);
+            // Ensure fileType is set even if missing in the database
+            if (!unmarshalled.fileType) {
+                // Determine fileType from fileUrl if possible
+                const fileUrl = unmarshalled.fileUrl || '';
+                if (fileUrl.match(/\.(mp4|mov|avi|wmv)$/i)) {
+                    unmarshalled.fileType = 'video';
+                } else if (fileUrl.match(/\.(jpg|jpeg|png|gif|webp)$/i)) {
+                    unmarshalled.fileType = 'image';
+                } else {
+                    // Default to image if can't determine
+                    unmarshalled.fileType = 'image';
+                }
+            }
+            return unmarshalled;
+        });
+        
+        console.log(`Returning ${mediaItems.length} processed items`);
         res.json(mediaItems);
         
     } catch (error) {
         console.error("Error fetching user media:", error);
-        res.status(500).json({ message: "Failed to fetch user media" });
+        res.status(500).json({ 
+            message: "Failed to fetch user media",
+            error: error.message,
+            success: false
+        });
     }
 });
-
 
 // **Start Server**
 app.listen(4000, () => console.log("Server running on port 4000"));
