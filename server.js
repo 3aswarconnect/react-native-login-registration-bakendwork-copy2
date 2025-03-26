@@ -3,7 +3,7 @@ import express from 'express'
 import cors from "cors";
 import multer from 'multer';
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import  { DynamoDBClient, PutItemCommand, GetItemCommand,ScanCommand,QueryCommand,UpdateItemCommand  } from "@aws-sdk/client-dynamodb";
+import  { DynamoDBClient, PutItemCommand, GetItemCommand,ScanCommand,QueryCommand,UpdateItemCommand ,BatchWriteItemCommand } from "@aws-sdk/client-dynamodb";
 import crypto from "crypto";
 import { unmarshall } from '@aws-sdk/util-dynamodb';
 import path from "path";
@@ -184,7 +184,6 @@ const upload = multer({ storage });
 
 app.post('/upload', upload.fields([{ name: 'file' }, { name: 'docfile' }]), async (req, res) => {
    
-    
     const { category, description, isPublic, userId } = req.body;
     if (!userId) return res.status(400).json({ message: 'User ID is required' });
     if (!req.files || !req.files.file) return res.status(400).json({ message: 'No file uploaded' });
@@ -196,6 +195,9 @@ app.post('/upload', upload.fields([{ name: 'file' }, { name: 'docfile' }]), asyn
         const fileName = `${fileId}-${file.originalname}`;
         const fileUrl = `https://${process.env.AWS_S3_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileName}`;
 
+        // Get current timestamp
+        const timestamp = new Date().toISOString();
+
         // Upload main file to S3
         await s3.send(new PutObjectCommand({
             Bucket: process.env.AWS_S3_BUCKET,
@@ -206,7 +208,6 @@ app.post('/upload', upload.fields([{ name: 'file' }, { name: 'docfile' }]), asyn
 
         let docFileUrl = null;
         let docFileName = null;
-        console.log(req.files.docfile);
         // If docfile is provided, upload it
         if (req.files.docfile) {
             const docfile = req.files.docfile[0];
@@ -235,6 +236,7 @@ app.post('/upload', upload.fields([{ name: 'file' }, { name: 'docfile' }]), asyn
                 fileName: { S: file.originalname },
                 fileUrl: { S: fileUrl },
                 fileType: { S: fileType },
+                timestamp: { S: timestamp }, // Added timestamp
                 ...(docFileUrl && { docFileUrl: { S: docFileUrl } }),
                 ...(docFileName && { docFileName: { S: docFileName } }),
             },
@@ -245,7 +247,8 @@ app.post('/upload', upload.fields([{ name: 'file' }, { name: 'docfile' }]), asyn
             fileId, 
             fileUrl, 
             fileType,
-            docFileUrl 
+            docFileUrl,
+            timestamp // Return timestamp in response
         });
     } catch (error) {
         res.status(500).json({ message: 'Upload failed: ' + error.message });
@@ -372,13 +375,17 @@ app.post('/profile-send', photoupload.single('file'), async (req, res) => {
                 Item: profileItem,
             })),
             
-            // Store email and userId in the 'youtube-demos' table
-            client.send(new PutItemCommand({
+            // Selectively update email in the 'youtube-demos' table
+            client.send(new UpdateItemCommand({
                 TableName: 'youtube-demos',
-                Item: {
-                    userId: { S: userId },
-                    email: { S: email }
-                }
+                Key: {
+                    userId: { S: userId }
+                },
+                UpdateExpression: 'SET email = :email',
+                ExpressionAttributeValues: {
+                    ':email': { S: email }
+                },
+                ReturnValues: 'NONE'
             }))
         ];
         
@@ -534,6 +541,78 @@ app.get('/getUserMedia', async (req, res) => {
         });
     }
 });
+
+
+// Categories we want to track
+const VALID_CATEGORIES = [
+    'Entertainment',
+    'Kids Corner',
+    'Food/cooking',
+    'News',
+    'Gaming',
+    'Motivation/Self Growth',
+    'Travel/Nature', 
+    'Tech/Education',
+    'Health/Fitness',
+    'Personal Thoughts'
+];
+
+// New endpoint for tracking category views
+app.post('/track-category-views', async (req, res) => {
+    const { userId, category, viewCount } = req.body;
+     console.log(userId,category,viewCount);
+    // Validate input
+    if (!userId) {
+        return res.status(400).json({ message: 'User ID is required' });
+    }
+
+    if (!category || !VALID_CATEGORIES.includes(category)) {
+        return res.status(400).json({ message: 'Invalid or missing category' });
+    }
+
+    if (!viewCount || viewCount <= 0) {
+        return res.status(400).json({ message: 'Invalid view count' });
+    }
+
+    try {
+        // Table name for category tracking
+        const TABLE_NAME = 'category-views-tracking';
+
+        // Prepare the update command
+        const updateCommand = new UpdateItemCommand({
+            TableName: TABLE_NAME,
+            Key: {
+                userId: { S: userId }
+            },
+            UpdateExpression: `SET #${category.replace(/\s+/g, '_')} = if_not_exists(#${category.replace(/\s+/g, '_')}, :zero) + :viewCount`,
+            ExpressionAttributeNames: {
+                [`#${category.replace(/\s+/g, '_')}`]: category.replace(/\s+/g, '_')
+            },
+            ExpressionAttributeValues: {
+                ':viewCount': { N: viewCount.toString() },
+                ':zero': { N: "0" }
+            },
+            ReturnValues: 'UPDATED_NEW'
+        });
+
+        // Execute the update
+        const result = await client.send(updateCommand);
+
+        res.json({ 
+            message: 'Category view tracked successfully',
+            updatedCategory: category,
+            viewCount: viewCount
+        });
+
+    } catch (error) {
+        console.error('Category tracking error:', error);
+        res.status(500).json({ 
+            message: 'Failed to track category view', 
+            error: error.message 
+        });
+    }
+});
+
 
 // **Start Server**
 app.listen(4000, () => console.log("Server running on port 4000"));
