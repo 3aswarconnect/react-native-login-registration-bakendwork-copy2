@@ -267,8 +267,9 @@ app.get('/reels', async (req, res) => {
             return {
                 ...video,
                 userId: video.userId,
-                docFileUrl: video.docFileUrl || null,  // Include docFileUrl in the response
-                docFileName: video.docFileName || null  // Include docFileName in the response
+                docFileUrl: video.docFileUrl || null,
+                docFileName: video.docFileName || null,
+                views: video.views || 0 // Include views count, default to 0 if not set
             };
         }).filter(video => video.fileType === 'video');
         
@@ -543,76 +544,333 @@ app.get('/getUserMedia', async (req, res) => {
 });
 
 
-// Categories we want to track
-const VALID_CATEGORIES = [
-    'Entertainment',
-    'Kids Corner',
-    'Food/cooking',
-    'News',
-    'Gaming',
-    'Motivation/Self Growth',
-    'Travel/Nature', 
-    'Tech/Education',
-    'Health/Fitness',
-    'Personal Thoughts'
-];
-
-// New endpoint for tracking category views
-app.post('/track-category-views', async (req, res) => {
-    const { userId, category, viewCount } = req.body;
-     console.log(userId,category,viewCount);
-    // Validate input
-    if (!userId) {
-        return res.status(400).json({ message: 'User ID is required' });
-    }
-
-    if (!category || !VALID_CATEGORIES.includes(category)) {
-        return res.status(400).json({ message: 'Invalid or missing category' });
-    }
-
-    if (!viewCount || viewCount <= 0) {
-        return res.status(400).json({ message: 'Invalid view count' });
+app.get('/search-users', async (req, res) => {
+    const { username } = req.query;
+   
+    if (!username) {
+        return res.status(400).json({ 
+            message: 'Username query is required',
+            success: false 
+        });
     }
 
     try {
-        // Table name for category tracking
-        const TABLE_NAME = 'category-views-tracking';
-
-        // Prepare the update command
-        const updateCommand = new UpdateItemCommand({
-            TableName: TABLE_NAME,
-            Key: {
-                userId: { S: userId }
-            },
-            UpdateExpression: `SET #${category.replace(/\s+/g, '_')} = if_not_exists(#${category.replace(/\s+/g, '_')}, :zero) + :viewCount`,
-            ExpressionAttributeNames: {
-                [`#${category.replace(/\s+/g, '_')}`]: category.replace(/\s+/g, '_')
-            },
-            ExpressionAttributeValues: {
-                ':viewCount': { N: viewCount.toString() },
-                ':zero': { N: "0" }
-            },
-            ReturnValues: 'UPDATED_NEW'
+        const command = new ScanCommand({
+            TableName: 'profile',
+            TableName: 'profile'
         });
 
-        // Execute the update
-        const result = await client.send(updateCommand);
+        const data = await client.send(command);
 
-        res.json({ 
-            message: 'Category view tracked successfully',
-            updatedCategory: category,
-            viewCount: viewCount
+        // Perform case-insensitive filtering in JavaScript
+        const users = data.Items
+            .filter(item => {
+                const itemUsername = item.username?.S?.toLowerCase() || '';
+                const searchTerm = username.toLowerCase();
+                return itemUsername.includes(searchTerm);
+            })
+            .map(item => ({
+                userId: item.userId?.S || '',
+                username: item.username?.S || '',
+                name: item.name?.S || '',
+                profilePhotoUrl: item.profilePhotoUrl?.S || '',
+                bio: item.bio?.S || '',
+                email: item.email?.S || ''
+            }));
+
+        res.json({
+            success: true,
+            users,
+            totalResults: users.length
         });
-
     } catch (error) {
-        console.error('Category tracking error:', error);
+        console.error('Search users error:', error);
         res.status(500).json({ 
-            message: 'Failed to track category view', 
-            error: error.message 
+            message: 'Failed to search users', 
+            error: error.message,
+            success: false 
         });
     }
 });
 
 
+// Add this to your backend code (server.js)
+// Update your /increment-views endpoint in server.js
+app.post('/increment-views', async (req, res) => {
+    const { videoIds } = req.body;
+  console.log(videoIds);
+    if (!videoIds || !Array.isArray(videoIds)) {
+        return res.status(400).json({ message: 'Video IDs array is required' });
+    }
+
+    try {
+        // Process updates with limited concurrency
+        const concurrency = 10; // Adjust based on your DynamoDB capacity
+        const batches = [];
+        
+        for (let i = 0; i < videoIds.length; i += concurrency) {
+            batches.push(videoIds.slice(i, i + concurrency));
+        }
+
+        const results = [];
+        let successCount = 0;
+
+        for (const batch of batches) {
+            const batchResults = await Promise.allSettled(
+                batch.map(fileId => {
+                    const updateCommand = new UpdateItemCommand({
+                        TableName: 'storage',
+                        Key: { fileId: { S: fileId } },
+                        UpdateExpression: 'SET #views = if_not_exists(#views, :zero) + :incr',
+                        ExpressionAttributeNames: {
+                            '#views': 'views'
+                        },
+                        ExpressionAttributeValues: {
+                            ':incr': { N: '1' },
+                            ':zero': { N: '0' }
+                        },
+                        ReturnValues: 'NONE'
+                    });
+                    return client.send(updateCommand);
+                })
+            );
+
+            batchResults.forEach((result, index) => {
+                const fileId = batch[index];
+                if (result.status === 'fulfilled') {
+                    successCount++;
+                    results.push({ fileId, status: 'success' });
+                } else {
+                    results.push({ 
+                        fileId, 
+                        status: 'failed', 
+                        error: result.reason.message 
+                    });
+                }
+            });
+        }
+
+        res.json({ 
+            message: 'Views update processed',
+            successCount,
+            failedCount: videoIds.length - successCount,
+            results
+        });
+    } catch (error) {
+        console.error('Error in increment-views endpoint:', error);
+        res.status(500).json({ 
+            message: 'Failed to process view updates', 
+            error: error.message,
+            details: error
+        });
+    }
+});
+
+
+
+// Add a streak to a profile
+app.post('/add-streak', async (req, res) => {
+    const { profileUserId, watchUserId } = req.body;
+    
+    if (!profileUserId || !watchUserId) {
+        return res.status(400).json({
+            success: false,
+            message: "Both profile user ID and watch user ID are required"
+        });
+    }
+    
+    // Don't allow users to give streaks to themselves
+    if (profileUserId === watchUserId) {
+        return res.status(400).json({
+            success: false,
+            message: "You cannot give a streak to your own profile"
+        });
+    }
+    
+    try {
+        // First check if the user has already given a streak
+        const getCommand = new GetItemCommand({
+            TableName: 'streaks',
+            Key: {
+                profileUserId: { S: profileUserId }
+            }
+        });
+        
+        const response = await client.send(getCommand);
+        
+        // If record exists, check if user already gave a streak
+        if (response.Item) {
+            const streakData = unmarshall(response.Item);
+            const streakUsers = streakData.streakUsers || [];
+            
+            // If user already gave a streak, return error
+            if (streakUsers.includes(watchUserId)) {
+                return res.status(400).json({
+                    success: false,
+                    message: "You have already given a streak to this profile",
+                    streakCount: streakData.streakCount || 0
+                });
+            }
+            
+            // User hasn't given a streak yet, update the record
+            const streakCount = parseInt(streakData.streakCount || 0) + 1;
+            streakUsers.push(watchUserId);
+            
+            const updateCommand = new UpdateItemCommand({
+                TableName: 'streaks',
+                Key: {
+                    profileUserId: { S: profileUserId }
+                },
+                UpdateExpression: 'SET streakCount = :count, streakUsers = :users',
+                ExpressionAttributeValues: {
+                    ':count': { N: streakCount.toString() },
+                    ':users': { L: streakUsers.map(id => ({ S: id })) }
+                },
+                ReturnValues: 'ALL_NEW'
+            });
+            
+            const updateResponse = await client.send(updateCommand);
+            const updatedItem = updateResponse.Attributes ? unmarshall(updateResponse.Attributes) : null;
+            
+            return res.json({
+                success: true,
+                message: "Streak given successfully",
+                streakCount: updatedItem?.streakCount || streakCount
+            });
+            
+        } else {
+            // No streak record exists yet, create a new one
+            const streakItem = {
+                profileUserId: { S: profileUserId },
+                streakCount: { N: "1" },
+                streakUsers: { L: [{ S: watchUserId }] },
+                updatedAt: { S: new Date().toISOString() }
+            };
+            
+            const putCommand = new PutItemCommand({
+                TableName: 'streaks',
+                Item: streakItem
+            });
+            
+            await client.send(putCommand);
+            
+            return res.json({
+                success: true,
+                message: "Streak given successfully",
+                streakCount: 1
+            });
+        }
+        
+    } catch (error) {
+        console.error("Error adding streak:", error);
+        return res.status(500).json({
+            success: false,
+            message: "Failed to add streak",
+            error: error.message
+        });
+    }
+});
+
+
+app.get('/check-streak', async (req, res) => {
+    const { profileUserId, watchUserId } = req.query;
+    
+    if (!profileUserId || !watchUserId) {
+        return res.status(400).json({ 
+            success: false,
+            message: "Both profile user ID and watch user ID are required"
+        });
+    }
+    
+    try {
+        // Get streak record for this profile from DynamoDB
+        const getCommand = new GetItemCommand({
+            TableName: 'streaks',
+            Key: {
+                profileUserId: { S: profileUserId }
+            }
+        });
+        
+        const response = await client.send(getCommand);
+        
+        // If no streak record exists yet, return default values
+        if (!response.Item) {
+            return res.json({
+                success: true,
+                streakCount: 0,
+                hasGivenStreak: false
+            });
+        }
+        
+        // Parse the streak data
+        const streakData = unmarshall(response.Item);
+        const streakCount = parseInt(streakData.streakCount || 0);
+        
+        // Check if watchUserId is in the streakUsers array
+        const streakUsers = streakData.streakUsers || [];
+        const hasGivenStreak = streakUsers.includes(watchUserId);
+        
+        return res.json({
+            success: true,
+            streakCount,
+            hasGivenStreak
+        });
+        
+    } catch (error) {
+        console.error("Error checking streak status:", error);
+        return res.status(500).json({
+            success: false,
+            message: "Failed to check streak status",
+            error: error.message
+        });
+    }
+});
+
+
+// Add this to your backend code (server.js)
+app.get('/get-streak-count', async (req, res) => {
+    const { profileUserId } = req.query;
+    
+    if (!profileUserId) {
+        return res.status(400).json({ 
+            success: false,
+            message: "Profile user ID is required"
+        });
+    }
+    
+    try {
+        const getCommand = new GetItemCommand({
+            TableName: 'streaks',
+            Key: {
+                profileUserId: { S: profileUserId }
+            }
+        });
+        
+        const response = await client.send(getCommand);
+        
+        if (!response.Item) {
+            return res.json({
+                success: true,
+                streakCount: 0
+            });
+        }
+        
+        const streakData = unmarshall(response.Item);
+        const streakCount = parseInt(streakData.streakCount || 0);
+        
+        return res.json({
+            success: true,
+            streakCount
+        });
+        
+    } catch (error) {
+        console.error("Error getting streak count:", error);
+        return res.status(500).json({
+            success: false,
+            message: "Failed to get streak count",
+            error: error.message
+        });
+    }
+});
 // **Start Server**
 app.listen(4000, () => console.log("Server running on port 4000"));
